@@ -10,6 +10,8 @@ const TICK_TEXT_COLOR = "#4f6277";
 const PLAYHEAD_COLOR = "#d62f2f";
 const HOVER_HEAD_COLOR = "rgba(12, 95, 112, 0.45)";
 const ZOOM_STEPS_SEC = [10, 20, 30, 60, 180, 300];
+const DRAG_THRESHOLD_PX = 6;
+const HANDLE_HIT_PX = 7;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -29,6 +31,122 @@ function formatTime(seconds) {
   return `${mm}:${ss}`;
 }
 
+function writeAscii(view, offset, text) {
+  for (let i = 0; i < text.length; i += 1) {
+    view.setUint8(offset + i, text.charCodeAt(i));
+  }
+}
+
+function audioBufferToWavBlob(audioBuffer) {
+  const channelCount = audioBuffer.numberOfChannels;
+  const sampleRate = audioBuffer.sampleRate;
+  const frameCount = audioBuffer.length;
+  const bitsPerSample = 16;
+  const bytesPerSample = bitsPerSample / 8;
+  const blockAlign = channelCount * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = frameCount * blockAlign;
+
+  const wav = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(wav);
+
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channelCount, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, dataSize, true);
+
+  const channels = [];
+
+  for (let ch = 0; ch < channelCount; ch += 1) {
+    channels.push(audioBuffer.getChannelData(ch));
+  }
+
+  let offset = 44;
+
+  for (let i = 0; i < frameCount; i += 1) {
+    for (let ch = 0; ch < channelCount; ch += 1) {
+      const v = clamp(channels[ch][i], -1, 1);
+      const int16 = v < 0 ? Math.round(v * 0x8000) : Math.round(v * 0x7fff);
+      view.setInt16(offset, int16, true);
+      offset += 2;
+    }
+  }
+
+  return new Blob([wav], { type: "audio/wav" });
+}
+function float32ToInt16Block(data, start, end) {
+  const size = end - start;
+  const out = new Int16Array(size);
+
+  for (let i = 0; i < size; i += 1) {
+    const v = clamp(data[start + i], -1, 1);
+    out[i] = v < 0 ? Math.round(v * 0x8000) : Math.round(v * 0x7fff);
+  }
+
+  return out;
+}
+
+function audioBufferToMp3Blob(audioBuffer, kbps = 128) {
+  if (!window.lamejs || typeof window.lamejs.Mp3Encoder !== "function") {
+    throw new Error("MP3エンコーダを読み込めませんでした。ネットワーク接続を確認してください。");
+  }
+
+  const channels = Math.min(2, audioBuffer.numberOfChannels);
+  const sampleRate = audioBuffer.sampleRate;
+  const encoder = new window.lamejs.Mp3Encoder(channels, sampleRate, kbps);
+  const blockSize = 1152;
+  const mp3Chunks = [];
+
+  const left = audioBuffer.getChannelData(0);
+  const right = channels === 2
+    ? audioBuffer.getChannelData(1)
+    : audioBuffer.getChannelData(0);
+
+  for (let i = 0; i < audioBuffer.length; i += blockSize) {
+    const end = Math.min(i + blockSize, audioBuffer.length);
+    const leftChunk = float32ToInt16Block(left, i, end);
+
+    let encoded;
+
+    if (channels === 2) {
+      const rightChunk = float32ToInt16Block(right, i, end);
+      encoded = encoder.encodeBuffer(leftChunk, rightChunk);
+    } else {
+      encoded = encoder.encodeBuffer(leftChunk);
+    }
+
+    if (encoded.length > 0) {
+      mp3Chunks.push(new Int8Array(encoded));
+    }
+  }
+
+  const flush = encoder.flush();
+
+  if (flush.length > 0) {
+    mp3Chunks.push(new Int8Array(flush));
+  }
+
+  return new Blob(mp3Chunks, { type: "audio/mpeg" });
+}
+
+function buildEditedFileName(originalName) {
+  if (!originalName) {
+    return "audio_edited.mp3";
+  }
+
+  const dot = originalName.lastIndexOf(".");
+  const base = dot > 0 ? originalName.slice(0, dot) : originalName;
+  return `${base}_edited.mp3`;
+}
 /**
  * 音声解析クラス。
  * 各ブロック(例:256サンプル)ごとに min/max を保持し、ズーム時に再利用する。
@@ -50,7 +168,8 @@ class WaveformAnalyzer {
 
     try {
       const audioBuffer = await context.decodeAudioData(arrayBuffer);
-      return this.buildWaveformData(audioBuffer);
+      const waveformData = this.buildWaveformData(audioBuffer);
+      return { audioBuffer, waveformData };
     } finally {
       await context.close().catch(() => {
         // close失敗は解析結果に影響しないため握りつぶす
@@ -136,6 +255,7 @@ class WaveformRenderer {
 
     this.mainCtx = this.mainCanvas.getContext("2d");
     this.overlayCtx = this.overlayCanvas.getContext("2d");
+    this.selectionPattern = this.createSelectionPattern();
 
     this.padding = { top: 16, right: 14, bottom: 30, left: 52 };
     this.zoomIntervalSec = 10;
@@ -198,6 +318,33 @@ class WaveformRenderer {
     this.overlayCanvas.width = Math.floor(width * dpr);
     this.overlayCanvas.height = Math.floor(CANVAS_HEIGHT * dpr);
     this.overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  createSelectionPattern() {
+    const tile = document.createElement("canvas");
+    tile.width = 12;
+    tile.height = 12;
+
+    const pctx = tile.getContext("2d");
+
+    if (!pctx) {
+      return null;
+    }
+
+    pctx.strokeStyle = "rgba(18, 59, 105, 0.35)";
+    pctx.lineWidth = 2;
+
+    pctx.beginPath();
+    pctx.moveTo(-2, 12);
+    pctx.lineTo(12, -2);
+    pctx.stroke();
+
+    pctx.beginPath();
+    pctx.moveTo(4, 14);
+    pctx.lineTo(14, 4);
+    pctx.stroke();
+
+    return this.overlayCtx.createPattern(tile, "repeat");
   }
 
   computeGeometry() {
@@ -386,7 +533,7 @@ class WaveformRenderer {
     ctx.fillText("time →", 8, CANVAS_HEIGHT - this.padding.bottom + 8);
   }
 
-  renderOverlay(playbackTime, hoverTime) {
+  renderOverlay(playbackTime, hoverTime, selectionRange = null, activeHandle = null) {
     this.overlayCtx.clearRect(0, 0, this.viewportWidth, CANVAS_HEIGHT);
 
     if (!this.data) {
@@ -394,6 +541,11 @@ class WaveformRenderer {
     }
 
     const scrollLeft = this.scrollContainer.scrollLeft;
+
+    if (selectionRange) {
+      const activeEdge = activeHandle ? activeHandle.edge : null;
+      this.drawSelectionRange(selectionRange, scrollLeft, activeEdge);
+    }
 
     if (typeof hoverTime === "number") {
       this.drawOverlayLine(hoverTime, HOVER_HEAD_COLOR, 1, scrollLeft);
@@ -404,6 +556,63 @@ class WaveformRenderer {
     }
   }
 
+  drawSelectionRange(range, scrollLeft, activeEdge = null) {
+    const chartTop = this.padding.top;
+    const chartBottom = CANVAS_HEIGHT - this.padding.bottom;
+    const chartHeight = chartBottom - chartTop;
+
+    const x1 = this.timeToX(range.start) - scrollLeft;
+    const x2 = this.timeToX(range.end) - scrollLeft;
+
+    let left = Math.min(x1, x2);
+    let right = Math.max(x1, x2);
+
+    if (right < 0 || left > this.viewportWidth) {
+      return;
+    }
+
+    left = clamp(left, 0, this.viewportWidth);
+    right = clamp(right, 0, this.viewportWidth);
+
+    const width = right - left;
+
+    if (width < 1) {
+      return;
+    }
+
+    this.overlayCtx.save();
+    this.overlayCtx.fillStyle = "rgba(28, 95, 166, 0.16)";
+    this.overlayCtx.fillRect(left, chartTop, width, chartHeight);
+
+    if (this.selectionPattern) {
+      this.overlayCtx.fillStyle = this.selectionPattern;
+      this.overlayCtx.fillRect(left, chartTop, width, chartHeight);
+    }
+
+    this.overlayCtx.strokeStyle = "rgba(20, 77, 137, 0.95)";
+    this.overlayCtx.lineWidth = 1;
+    this.overlayCtx.beginPath();
+    this.overlayCtx.moveTo(left + 0.5, chartTop);
+    this.overlayCtx.lineTo(left + 0.5, chartBottom);
+    this.overlayCtx.moveTo(right - 0.5, chartTop);
+    this.overlayCtx.lineTo(right - 0.5, chartBottom);
+    this.overlayCtx.stroke();
+
+    this.drawSelectionHandles(left, right, chartTop, chartHeight, activeEdge);
+    this.overlayCtx.restore();
+  }
+
+  drawSelectionHandles(left, right, top, height, activeEdge) {
+    const handleWidth = 6;
+
+    const drawHandle = (x, isActive) => {
+      this.overlayCtx.fillStyle = isActive ? "rgba(17, 82, 153, 0.95)" : "rgba(17, 82, 153, 0.65)";
+      this.overlayCtx.fillRect(x - handleWidth / 2, top, handleWidth, height);
+    };
+
+    drawHandle(left, activeEdge === "start");
+    drawHandle(right, activeEdge === "end");
+  }
   drawOverlayLine(time, color, width, scrollLeft) {
     const xGlobal = this.timeToX(time);
     const x = xGlobal - scrollLeft;
@@ -466,6 +675,8 @@ class WaveformApp {
     this.playButton = document.getElementById("playButton");
     this.pauseButton = document.getElementById("pauseButton");
     this.stopButton = document.getElementById("stopButton");
+    this.cutButton = document.getElementById("cutButton");
+    this.exportButton = document.getElementById("exportButton");
 
     this.volumeSlider = document.getElementById("volumeSlider");
     this.volumeValue = document.getElementById("volumeValue");
@@ -475,6 +686,7 @@ class WaveformApp {
 
     this.statusText = document.getElementById("statusText");
     this.metaText = document.getElementById("metaText");
+    this.selectionText = document.getElementById("selectionText");
 
     this.audio = document.getElementById("audioPlayer");
     this.mainCanvas = document.getElementById("waveCanvas");
@@ -492,8 +704,15 @@ class WaveformApp {
     );
 
     this.waveformData = null;
+    this.audioBufferData = null;
     this.currentObjectUrl = "";
+    this.currentFileName = "";
+    this.pendingSeekTime = null;
     this.hoverTime = null;
+    this.selectionRange = null;
+    this.dragState = null;
+    this.activeHandle = null;
+    this.suppressClickJump = false;
     this.rafId = 0;
 
     this.analyzeButton.disabled = true;
@@ -503,6 +722,7 @@ class WaveformApp {
     this.updateVolumeView(100);
     this.updateTimeView(0, 0);
     this.setStatus("ファイルを選択してください。");
+    this.updateSelectionInfo(null);
     this.updateControlAvailability();
   }
 
@@ -545,7 +765,20 @@ class WaveformApp {
       this.updateControlAvailability();
     });
 
+    this.cutButton.addEventListener("click", async () => {
+      await this.handleCutSelectedSegment();
+    });
+
+    this.exportButton.addEventListener("click", async () => {
+      await this.handleExportMp3();
+    });
+
     this.audio.addEventListener("loadedmetadata", () => {
+      if (typeof this.pendingSeekTime === "number") {
+        this.audio.currentTime = clamp(this.pendingSeekTime, 0, this.getDuration());
+        this.pendingSeekTime = null;
+      }
+
       this.updateTimeView(this.audio.currentTime, this.getDuration());
       this.renderFrame();
       this.updateControlAvailability();
@@ -578,18 +811,48 @@ class WaveformApp {
       this.updateControlAvailability();
     });
 
+    this.mainCanvas.addEventListener("mousedown", (event) => {
+      this.beginSelectionDrag(event);
+    });
+
     this.mainCanvas.addEventListener("click", (event) => {
+      if (this.suppressClickJump) {
+        this.suppressClickJump = false;
+        return;
+      }
+
       this.handleCanvasClick(event);
     });
 
     this.mainCanvas.addEventListener("mousemove", (event) => {
+      if (this.dragState) {
+        this.updateSelectionDrag(event.clientX);
+        return;
+      }
+
       this.handleCanvasHover(event);
     });
 
     this.mainCanvas.addEventListener("mouseleave", () => {
+      if (this.dragState) {
+        return;
+      }
+
       this.hoverTime = null;
       this.tooltip.hidden = true;
       this.renderFrame();
+    });
+
+    window.addEventListener("mousemove", (event) => {
+      if (!this.dragState) {
+        return;
+      }
+
+      this.updateSelectionDrag(event.clientX);
+    });
+
+    window.addEventListener("mouseup", (event) => {
+      this.endSelectionDrag(event);
     });
 
     this.scrollContainer.addEventListener("scroll", () => {
@@ -607,7 +870,6 @@ class WaveformApp {
           return;
         }
 
-        // Ctrl + ホイール時は横スクロールではなくズーム段階を切り替える
         if (event.ctrlKey) {
           event.preventDefault();
           const direction = delta < 0 ? -1 : 1;
@@ -615,7 +877,6 @@ class WaveformApp {
           return;
         }
 
-        // 通常ホイールは波形エリアの横スクロール
         event.preventDefault();
         this.scrollContainer.scrollLeft += delta;
       },
@@ -623,6 +884,11 @@ class WaveformApp {
     );
 
     window.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && this.clearSelection()) {
+        event.preventDefault();
+        return;
+      }
+
       if (!this.shouldHandleSpaceShortcut(event)) {
         return;
       }
@@ -703,6 +969,339 @@ class WaveformApp {
     this.applyZoom(ZOOM_STEPS_SEC[nextIndex]);
   }
 
+  beginSelectionDrag(event) {
+    if (!this.waveformData || event.button !== 0) {
+      return;
+    }
+
+    event.preventDefault();
+
+    const edge = this.findHandleHit(event.clientX);
+
+    if (edge) {
+      this.dragState = {
+        mode: "resize",
+        edge,
+      };
+      this.activeHandle = { edge };
+    } else {
+      const startTime = this.renderer.timeFromPointerEvent(event);
+      this.dragState = {
+        mode: "create",
+        anchorTime: startTime,
+        currentTime: startTime,
+        startClientX: event.clientX,
+        moved: false,
+      };
+      this.activeHandle = null;
+    }
+
+    this.hoverTime = null;
+    this.tooltip.hidden = true;
+    this.updateSelectionInfo(this.getActiveSelectionRange());
+    this.renderFrame();
+  }
+
+  updateSelectionDrag(clientX) {
+    if (!this.dragState || !this.waveformData) {
+      return;
+    }
+
+    if (this.dragState.mode === "create") {
+      this.dragState.currentTime = this.timeFromClientX(clientX);
+      this.dragState.moved = Math.abs(clientX - this.dragState.startClientX) >= DRAG_THRESHOLD_PX;
+    } else if (this.selectionRange) {
+      const duration = this.getDuration();
+      const targetTime = clamp(this.timeFromClientX(clientX), 0, duration);
+
+      if (this.dragState.edge === "start") {
+        this.selectionRange.start = clamp(targetTime, 0, this.selectionRange.end);
+      } else {
+        this.selectionRange.end = clamp(targetTime, this.selectionRange.start, duration);
+      }
+    }
+
+    this.hoverTime = null;
+    this.tooltip.hidden = true;
+    this.updateSelectionInfo(this.getActiveSelectionRange());
+    this.renderFrame();
+  }
+
+  endSelectionDrag(event) {
+    if (!this.dragState || !this.waveformData) {
+      return;
+    }
+
+    this.updateSelectionDrag(event.clientX);
+
+    if (this.dragState.mode === "create") {
+      if (this.dragState.moved) {
+        const normalized = this.normalizeSelectionRange(
+          this.dragState.anchorTime,
+          this.dragState.currentTime
+        );
+
+        if (normalized.end - normalized.start > 0.0001) {
+          this.selectionRange = normalized;
+          this.suppressNextClickJump();
+          this.setStatus(
+            `区間選択: ${formatTime(normalized.start)} - ${formatTime(normalized.end)} (${(normalized.end - normalized.start).toFixed(2)}秒)`
+          );
+        }
+      }
+    } else {
+      if (this.selectionRange && this.selectionRange.end - this.selectionRange.start <= 0.0001) {
+        this.selectionRange = null;
+        this.setStatus("端点調整で長さ0になったため選択を解除しました。");
+      } else if (this.selectionRange) {
+        this.setStatus(
+          `区間を調整: ${formatTime(this.selectionRange.start)} - ${formatTime(this.selectionRange.end)} (${(this.selectionRange.end - this.selectionRange.start).toFixed(2)}秒)`
+        );
+      }
+
+      this.suppressNextClickJump();
+    }
+
+    this.dragState = null;
+    this.activeHandle = null;
+    this.updateSelectionInfo(this.selectionRange);
+    this.updateControlAvailability();
+    this.renderFrame();
+  }
+
+  timeFromClientX(clientX) {
+    return this.renderer.xToTime(this.getCanvasX(clientX));
+  }
+
+  getCanvasX(clientX) {
+    const rect = this.mainCanvas.getBoundingClientRect();
+    return clientX - rect.left;
+  }
+
+  findHandleHit(clientX) {
+    if (!this.waveformData || !this.selectionRange) {
+      return null;
+    }
+
+    const x = this.getCanvasX(clientX);
+    const startDist = Math.abs(x - this.renderer.timeToX(this.selectionRange.start));
+    const endDist = Math.abs(x - this.renderer.timeToX(this.selectionRange.end));
+
+    if (startDist > HANDLE_HIT_PX && endDist > HANDLE_HIT_PX) {
+      return null;
+    }
+
+    return startDist <= endDist ? "start" : "end";
+  }
+
+  normalizeSelectionRange(t1, t2) {
+    const start = Math.min(t1, t2);
+    const end = Math.max(t1, t2);
+    return { start, end };
+  }
+
+  getActiveSelectionRange() {
+    if (this.dragState && this.dragState.mode === "create" && this.dragState.moved) {
+      return this.normalizeSelectionRange(this.dragState.anchorTime, this.dragState.currentTime);
+    }
+
+    return this.selectionRange;
+  }
+
+  suppressNextClickJump() {
+    this.suppressClickJump = true;
+    window.setTimeout(() => {
+      this.suppressClickJump = false;
+    }, 0);
+  }
+
+  clearSelection() {
+    if (!this.selectionRange && !this.dragState) {
+      return false;
+    }
+
+    this.selectionRange = null;
+    this.dragState = null;
+    this.activeHandle = null;
+    this.updateSelectionInfo(null);
+    this.updateControlAvailability();
+    this.renderFrame();
+    this.setStatus("選択範囲を解除しました。");
+    return true;
+  }
+
+  updateSelectionInfo(range) {
+    if (!this.selectionText) {
+      return;
+    }
+
+    if (!range) {
+      this.selectionText.textContent = "選択範囲: なし";
+      return;
+    }
+
+    const duration = Math.max(0, range.end - range.start);
+    this.selectionText.textContent =
+      `選択範囲: ${formatTime(range.start)} - ${formatTime(range.end)} (長さ ${duration.toFixed(2)}秒)`;
+  }
+
+  async createEmptyAudioBuffer(sampleRate, channelCount, length) {
+    if (typeof AudioBuffer === "function") {
+      try {
+        return new AudioBuffer({
+          length,
+          numberOfChannels: channelCount,
+          sampleRate,
+        });
+      } catch (_) {
+        // fallback below
+      }
+    }
+
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+
+    if (!AudioCtx) {
+      throw new Error("このブラウザはAudioBuffer生成に対応していません。");
+    }
+
+    const context = new AudioCtx();
+
+    try {
+      return context.createBuffer(channelCount, length, sampleRate);
+    } finally {
+      await context.close().catch(() => {
+        // close失敗は後続に影響しない
+      });
+    }
+  }
+
+  async handleCutSelectedSegment() {
+    if (!this.audioBufferData || !this.selectionRange) {
+      return;
+    }
+
+    const sourceBuffer = this.audioBufferData;
+    const sampleRate = sourceBuffer.sampleRate;
+    const totalSamples = sourceBuffer.length;
+
+    const startTime = clamp(Math.min(this.selectionRange.start, this.selectionRange.end), 0, sourceBuffer.duration);
+    const endTime = clamp(Math.max(this.selectionRange.start, this.selectionRange.end), 0, sourceBuffer.duration);
+
+    const startSample = clamp(Math.floor(startTime * sampleRate), 0, totalSamples);
+    const endSample = clamp(Math.ceil(endTime * sampleRate), startSample, totalSamples);
+    const removedSamples = endSample - startSample;
+
+    if (removedSamples <= 0) {
+      this.setStatus("有効な選択区間がありません。", true);
+      return;
+    }
+
+    const newLength = totalSamples - removedSamples;
+
+    if (newLength <= 0) {
+      this.setStatus("音声全体が選択されています。最低1区間は残してください。", true);
+      return;
+    }
+
+    const oldTime = this.audio.currentTime;
+    const wasPlaying = this.isPlaying();
+
+    try {
+      this.setStatus("選択区間をカットしています...");
+      this.audio.pause();
+      this.stopRenderLoop();
+
+      const channelCount = sourceBuffer.numberOfChannels;
+      const newBuffer = await this.createEmptyAudioBuffer(sampleRate, channelCount, newLength);
+
+      for (let ch = 0; ch < channelCount; ch += 1) {
+        const src = sourceBuffer.getChannelData(ch);
+        const dst = newBuffer.getChannelData(ch);
+
+        const before = src.subarray(0, startSample);
+        dst.set(before, 0);
+
+        const after = src.subarray(endSample);
+        dst.set(after, before.length);
+      }
+
+      const newWaveformData = this.analyzer.buildWaveformData(newBuffer);
+      const wavBlob = audioBufferToWavBlob(newBuffer);
+
+      let mappedTime = oldTime;
+
+      if (oldTime > endTime) {
+        mappedTime = oldTime - (endTime - startTime);
+      } else if (oldTime > startTime) {
+        mappedTime = startTime;
+      }
+
+      mappedTime = clamp(mappedTime, 0, newWaveformData.duration);
+
+      this.audioBufferData = newBuffer;
+      this.waveformData = newWaveformData;
+
+      this.renderer.setZoomInterval(Number(this.zoomSelect.value));
+      this.renderer.setData(newWaveformData);
+
+      this.setAudioSource(wavBlob, mappedTime);
+      this.selectionRange = null;
+      this.dragState = null;
+      this.activeHandle = null;
+      this.hoverTime = null;
+      this.tooltip.hidden = true;
+
+      this.renderer.scrollToTime(mappedTime);
+      this.updateTimeView(mappedTime, newWaveformData.duration);
+      this.updateSelectionInfo(null);
+      this.updateControlAvailability();
+      this.renderFrame();
+
+      this.metaText.textContent =
+        `長さ: ${newWaveformData.duration.toFixed(2)}秒 / サンプルレート: ${newWaveformData.sampleRate}Hz / ` +
+        `チャンネル: ${newWaveformData.channelCount} / ブロック数: ${newWaveformData.blockCount}`;
+      this.setStatus(`カット完了: ${(endTime - startTime).toFixed(2)}秒を削除しました。`);
+
+      if (wasPlaying) {
+        await this.audio.play().catch(() => {
+          // 再生失敗時はUIのみ更新
+        });
+      }
+    } catch (error) {
+      this.setStatus("カット処理に失敗しました。", true);
+      this.metaText.textContent = String(error);
+    } finally {
+      this.updateControlAvailability();
+    }
+  }
+
+  async handleExportMp3() {
+    if (!this.audioBufferData) {
+      this.setStatus("先に音声を読み込んでください。", true);
+      return;
+    }
+
+    try {
+      this.setStatus("MP3を書き出し中です...");
+      const mp3Blob = audioBufferToMp3Blob(this.audioBufferData, 128);
+      const fileName = buildEditedFileName(this.currentFileName);
+
+      const url = URL.createObjectURL(mp3Blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+      this.setStatus(`MP3を書き出しました: ${fileName}`);
+    } catch (error) {
+      this.setStatus("MP3書き出しに失敗しました。", true);
+      this.metaText.textContent = String(error);
+    }
+  }
+
   async handleAnalyze() {
     const file = this.getSelectedFile();
 
@@ -716,33 +1315,44 @@ class WaveformApp {
       this.setStatus("解析中です... 少し待ってください。");
       this.metaText.textContent = "";
 
-      const result = await this.analyzer.analyzeFile(file);
+      const { audioBuffer, waveformData } = await this.analyzer.analyzeFile(file);
 
-      this.waveformData = result;
+      this.currentFileName = file.name;
+      this.audioBufferData = audioBuffer;
+      this.waveformData = waveformData;
       this.renderer.setZoomInterval(Number(this.zoomSelect.value));
-      this.renderer.setData(result);
+      this.renderer.setData(waveformData);
 
-      this.setAudioSource(file);
-      this.audio.currentTime = 0;
+      this.setAudioSource(file, 0);
       this.renderer.scrollToTime(0);
 
-      this.updateTimeView(0, result.duration);
+      this.updateTimeView(0, waveformData.duration);
       this.hoverTime = null;
+      this.selectionRange = null;
+      this.dragState = null;
+      this.activeHandle = null;
       this.tooltip.hidden = true;
+      this.updateSelectionInfo(null);
       this.renderFrame();
 
       this.metaText.textContent =
-        `長さ: ${result.duration.toFixed(2)}秒 / サンプルレート: ${result.sampleRate}Hz / ` +
-        `チャンネル: ${result.channelCount} / ブロック数: ${result.blockCount}`;
+        `長さ: ${waveformData.duration.toFixed(2)}秒 / サンプルレート: ${waveformData.sampleRate}Hz / ` +
+        `チャンネル: ${waveformData.channelCount} / ブロック数: ${waveformData.blockCount}`;
 
-      this.setStatus("解析完了。波形をクリックすると再生位置を移動できます。");
+      this.setStatus("解析完了。クリックで再生位置移動、ドラッグで区間選択、端点ドラッグで調整できます。");
     } catch (error) {
       this.waveformData = null;
+      this.audioBufferData = null;
+      this.currentFileName = "";
       this.renderer.clearData();
       this.clearAudioSource();
       this.updateTimeView(0, 0);
       this.setStatus("解析に失敗しました。mp3ファイルを確認してください。", true);
       this.metaText.textContent = String(error);
+      this.selectionRange = null;
+      this.dragState = null;
+      this.activeHandle = null;
+      this.updateSelectionInfo(null);
     } finally {
       this.disableWhileAnalyzing(false);
     }
@@ -785,7 +1395,7 @@ class WaveformApp {
   }
 
   handleCanvasHover(event) {
-    if (!this.waveformData) {
+    if (!this.waveformData || this.dragState) {
       return;
     }
 
@@ -797,10 +1407,11 @@ class WaveformApp {
     this.renderFrame();
   }
 
-  setAudioSource(file) {
+  setAudioSource(mediaSource, seekTime = 0) {
     this.clearAudioSource();
-    this.currentObjectUrl = URL.createObjectURL(file);
+    this.currentObjectUrl = URL.createObjectURL(mediaSource);
     this.audio.src = this.currentObjectUrl;
+    this.pendingSeekTime = seekTime;
     this.audio.load();
   }
 
@@ -811,6 +1422,8 @@ class WaveformApp {
       URL.revokeObjectURL(this.currentObjectUrl);
       this.currentObjectUrl = "";
     }
+
+    this.pendingSeekTime = null;
 
     if (this.audio.src) {
       this.audio.removeAttribute("src");
@@ -903,7 +1516,8 @@ class WaveformApp {
 
   renderFrame() {
     const playTime = this.waveformData ? this.audio.currentTime : null;
-    this.renderer.renderOverlay(playTime, this.hoverTime);
+    const activeSelection = this.getActiveSelectionRange();
+    this.renderer.renderOverlay(playTime, this.hoverTime, activeSelection, this.activeHandle);
   }
 
   updateTimeView(current, total) {
@@ -917,6 +1531,8 @@ class WaveformApp {
       this.playButton.disabled = true;
       this.pauseButton.disabled = true;
       this.stopButton.disabled = true;
+      this.cutButton.disabled = true;
+      this.exportButton.disabled = true;
       this.stopRenderLoop();
       this.audio.pause();
       return;
@@ -933,12 +1549,16 @@ class WaveformApp {
       this.playButton.disabled = true;
       this.pauseButton.disabled = true;
       this.stopButton.disabled = true;
+      this.cutButton.disabled = true;
+      this.exportButton.disabled = true;
       return;
     }
 
     this.playButton.disabled = this.isPlaying();
     this.pauseButton.disabled = !this.isPlaying();
     this.stopButton.disabled = !this.isPlaying() && this.audio.currentTime <= 0;
+    this.cutButton.disabled = !this.selectionRange;
+    this.exportButton.disabled = false;
   }
 
   setStatus(message, isError = false) {
@@ -950,10 +1570,4 @@ class WaveformApp {
 window.addEventListener("DOMContentLoaded", () => {
   new WaveformApp();
 });
-
-
-
-
-
-
 

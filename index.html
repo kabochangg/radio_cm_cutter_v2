@@ -41,6 +41,12 @@
           <button id="pauseButton" type="button" disabled>一時停止</button>
           <button id="stopButton" type="button" disabled>停止</button>
         </div>
+        <div class="edit-row">
+          <div class="edit-buttons">
+            <button id="cutButton" type="button" disabled>Cut selected segment</button>
+            <button id="exportButton" type="button" disabled>Export MP3</button>
+          </div>
+        </div>
 
         <div class="volume-row">
           <label for="volumeSlider">音量</label>
@@ -53,13 +59,14 @@
           <span>/</span>
           <span id="totalTimeText">0:00</span>
         </p>
-        <p class="hint">波形エリアは横スクロールできます。クリックで再生位置を移動できます。</p>
+        <p class="hint">波形エリアは横スクロールできます。クリックで再生位置移動、ドラッグで区間選択、端点ドラッグで調整できます。</p>
         <audio id="audioPlayer" preload="metadata"></audio>
       </section>
 
       <section class="status-panel">
         <p id="statusText">ファイルを選択してください。</p>
         <p id="metaText"></p>
+        <p id="selectionText" class="selection-text">選択範囲: なし</p>
       </section>
 
       <section class="chart-wrap">
@@ -74,9 +81,8 @@
       </section>
     </main>
 
+    <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
     <script src="./script.js" defer></script>
   </body>
 </html>
-
-
 

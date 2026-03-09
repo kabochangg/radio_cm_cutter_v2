@@ -117,6 +117,16 @@ button:disabled {
   gap: 8px;
 }
 
+.edit-row {
+  margin-top: 8px;
+}
+
+.edit-buttons {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(120px, 170px));
+  gap: 8px;
+}
+
 .volume-row {
   margin-top: 10px;
   display: grid;
@@ -149,6 +159,11 @@ button:disabled {
 
 .status-panel p {
   margin: 6px 0;
+}
+
+.selection-text {
+  color: var(--subtext);
+  font-size: 0.92rem;
 }
 
 .canvas-shell {
@@ -209,6 +224,10 @@ audio {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
+  .edit-buttons {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .volume-row {
     grid-template-columns: auto 1fr;
   }
@@ -218,3 +237,4 @@ audio {
     text-align: left;
   }
 }
+
