@@ -166,6 +166,31 @@ button:disabled {
   font-size: 0.92rem;
 }
 
+.minimap-wrap {
+  margin-bottom: 6px;
+  border: 1px solid #c8d4df;
+  border-radius: 10px;
+  overflow: hidden;
+  background: linear-gradient(180deg, #f8fbff 0%, #edf4fb 100%);
+}
+
+#miniMapCanvas {
+  display: block;
+  width: 100%;
+  height: 86px;
+  cursor: grab;
+}
+
+#miniMapCanvas.dragging {
+  cursor: grabbing;
+}
+
+.minimap-hint {
+  margin: 0 0 8px;
+  color: var(--subtext);
+  font-size: 0.88rem;
+}
+
 .canvas-shell {
   position: relative;
 }

@@ -1,4 +1,5 @@
 ﻿const CANVAS_HEIGHT = 280;
+const MINIMAP_HEIGHT = 86;
 const TICK_SPACING_PX = 100;
 const MAX_CANVAS_PIXELS = 20_000_000;
 const MAX_CANVAS_BITMAP_WIDTH = 32767;
@@ -247,17 +248,20 @@ class WaveformAnalyzer {
  * 目盛り線ピクセル間隔を固定し、ズームで1目盛り秒数だけ変える。
  */
 class WaveformRenderer {
-  constructor(mainCanvas, overlayCanvas, scrollContainer, shell) {
+  constructor(mainCanvas, overlayCanvas, scrollContainer, shell, miniCanvas = null) {
     this.mainCanvas = mainCanvas;
     this.overlayCanvas = overlayCanvas;
     this.scrollContainer = scrollContainer;
     this.shell = shell;
+    this.miniCanvas = miniCanvas;
 
     this.mainCtx = this.mainCanvas.getContext("2d");
     this.overlayCtx = this.overlayCanvas.getContext("2d");
+    this.miniCtx = this.miniCanvas ? this.miniCanvas.getContext("2d") : null;
     this.selectionPattern = this.createSelectionPattern();
 
     this.padding = { top: 16, right: 14, bottom: 30, left: 52 };
+    this.miniPadding = { top: 8, right: 8, bottom: 8, left: 8 };
     this.zoomIntervalSec = 10;
     // 波形本体は内部解像度を固定し、横幅上限を広く確保してズーム差を出しやすくする
     this.mainRenderDpr = 1;
@@ -269,14 +273,21 @@ class WaveformRenderer {
     this.viewportWidth = 1200;
     this.cappedByMemory = false;
 
+    this.minimapWidth = 0;
+    this.minimapPlotWidth = 0;
+    this.minimapCacheCanvas = null;
+
     this.resizeViewport();
+    this.resizeMiniMap();
     this.drawEmpty();
     this.renderOverlay(null, null);
+    this.renderMiniMap(null);
   }
 
   setData(data) {
     this.data = data;
     this.redrawStatic();
+    this.redrawMiniMapStatic();
   }
 
   clearData() {
@@ -285,6 +296,8 @@ class WaveformRenderer {
     this.totalWidth = this.viewportWidth;
     this.resizeMainCanvas();
     this.drawEmpty();
+    this.minimapCacheCanvas = null;
+    this.drawMiniMapEmpty();
     this.renderOverlay(null, null);
   }
 
@@ -318,6 +331,49 @@ class WaveformRenderer {
     this.overlayCanvas.width = Math.floor(width * dpr);
     this.overlayCanvas.height = Math.floor(CANVAS_HEIGHT * dpr);
     this.overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  resizeMiniMap() {
+    if (!this.miniCanvas || !this.miniCtx) {
+      return;
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    const width = Math.max(320, Math.floor(this.shell.clientWidth || this.scrollContainer.clientWidth || 1200));
+
+    this.minimapWidth = width;
+    this.minimapPlotWidth = Math.max(1, width - this.miniPadding.left - this.miniPadding.right);
+
+    this.miniCanvas.style.width = `${width}px`;
+    this.miniCanvas.style.height = `${MINIMAP_HEIGHT}px`;
+
+    this.miniCanvas.width = Math.floor(width * dpr);
+    this.miniCanvas.height = Math.floor(MINIMAP_HEIGHT * dpr);
+    this.miniCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    if (this.data) {
+      this.redrawMiniMapStatic();
+    } else {
+      this.drawMiniMapEmpty();
+    }
+  }
+
+  drawMiniMapEmpty() {
+    if (!this.miniCtx) {
+      return;
+    }
+
+    const width = this.minimapWidth || Math.floor(this.shell.clientWidth || 1200);
+
+    this.miniCtx.clearRect(0, 0, width, MINIMAP_HEIGHT);
+    this.miniCtx.fillStyle = "#f6fbff";
+    this.miniCtx.fillRect(0, 0, width, MINIMAP_HEIGHT);
+
+    this.miniCtx.fillStyle = "#6d7e90";
+    this.miniCtx.font = "12px Segoe UI, sans-serif";
+    this.miniCtx.textAlign = "center";
+    this.miniCtx.textBaseline = "middle";
+    this.miniCtx.fillText("ミニマップ", width / 2, MINIMAP_HEIGHT / 2);
   }
 
   createSelectionPattern() {
@@ -396,6 +452,82 @@ class WaveformRenderer {
     this.mainCtx.textAlign = "center";
     this.mainCtx.textBaseline = "middle";
     this.mainCtx.fillText("ここに波形が表示されます", this.totalWidth / 2, CANVAS_HEIGHT / 2);
+  }
+
+  redrawMiniMapStatic() {
+    if (!this.miniCtx) {
+      return;
+    }
+
+    if (!this.data) {
+      this.minimapCacheCanvas = null;
+      this.drawMiniMapEmpty();
+      return;
+    }
+
+    const cache = document.createElement("canvas");
+    cache.width = this.minimapWidth;
+    cache.height = MINIMAP_HEIGHT;
+
+    const ctx = cache.getContext("2d");
+
+    if (!ctx) {
+      return;
+    }
+
+    ctx.clearRect(0, 0, this.minimapWidth, MINIMAP_HEIGHT);
+    ctx.fillStyle = "#f6fbff";
+    ctx.fillRect(0, 0, this.minimapWidth, MINIMAP_HEIGHT);
+
+    const top = this.miniPadding.top;
+    const left = this.miniPadding.left;
+    const zeroY = MINIMAP_HEIGHT - this.miniPadding.bottom - 1;
+    const usableHeight = Math.max(1, zeroY - top);
+
+    ctx.strokeStyle = GRID_COLOR;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(left, zeroY + 0.5);
+    ctx.lineTo(left + this.minimapPlotWidth, zeroY + 0.5);
+    ctx.stroke();
+
+    const { minValues, maxValues, blockCount, blockSize, sampleRate } = this.data;
+
+    if (blockCount > 0 && this.data.duration > 0) {
+      const miniPps = this.minimapPlotWidth / this.data.duration;
+      const samplesPerPixel = sampleRate / miniPps;
+      const blocksPerPixel = samplesPerPixel / blockSize;
+      const pixelColumns = Math.max(1, Math.floor(this.minimapPlotWidth));
+
+      ctx.strokeStyle = WAVE_COLOR;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+
+      for (let x = 0; x < pixelColumns; x += 1) {
+        const startBlock = clamp(Math.floor(x * blocksPerPixel), 0, blockCount - 1);
+        const endBlock = clamp(Math.floor((x + 1) * blocksPerPixel), startBlock, blockCount - 1);
+
+        let peak = 0;
+
+        for (let b = startBlock; b <= endBlock; b += 1) {
+          const localPeak = Math.max(Math.abs(minValues[b]), Math.abs(maxValues[b]));
+
+          if (localPeak > peak) {
+            peak = localPeak;
+          }
+        }
+
+        const yTop = zeroY - peak * usableHeight;
+        const px = left + x + 0.5;
+
+        ctx.moveTo(px, zeroY);
+        ctx.lineTo(px, yTop);
+      }
+
+      ctx.stroke();
+    }
+
+    this.minimapCacheCanvas = cache;
   }
 
   drawStaticLayer() {
@@ -629,6 +761,109 @@ class WaveformRenderer {
     this.overlayCtx.stroke();
   }
 
+  renderMiniMap(playbackTime = null) {
+    if (!this.miniCtx) {
+      return;
+    }
+
+    if (!this.data || !this.minimapCacheCanvas) {
+      this.drawMiniMapEmpty();
+      return;
+    }
+
+    this.miniCtx.clearRect(0, 0, this.minimapWidth, MINIMAP_HEIGHT);
+    this.miniCtx.drawImage(this.minimapCacheCanvas, 0, 0, this.minimapWidth, MINIMAP_HEIGHT);
+
+    const viewport = this.getMiniViewportRect();
+
+    if (viewport) {
+      const chartTop = this.miniPadding.top;
+      const chartHeight = MINIMAP_HEIGHT - this.miniPadding.top - this.miniPadding.bottom;
+
+      this.miniCtx.fillStyle = "rgba(17, 82, 153, 0.14)";
+      this.miniCtx.fillRect(viewport.left, chartTop, viewport.width, chartHeight);
+
+      this.miniCtx.strokeStyle = "rgba(17, 82, 153, 0.9)";
+      this.miniCtx.lineWidth = 1;
+      this.miniCtx.strokeRect(
+        viewport.left + 0.5,
+        chartTop + 0.5,
+        Math.max(1, viewport.width - 1),
+        Math.max(1, chartHeight - 1)
+      );
+    }
+
+    if (typeof playbackTime === "number") {
+      const x = this.timeToMiniX(playbackTime);
+      this.miniCtx.strokeStyle = PLAYHEAD_COLOR;
+      this.miniCtx.lineWidth = 1.5;
+      this.miniCtx.beginPath();
+      this.miniCtx.moveTo(x, this.miniPadding.top);
+      this.miniCtx.lineTo(x, MINIMAP_HEIGHT - this.miniPadding.bottom);
+      this.miniCtx.stroke();
+    }
+  }
+
+  getMiniViewportRect() {
+    if (!this.data || this.minimapPlotWidth <= 0) {
+      return null;
+    }
+
+    const safeTotalWidth = Math.max(1, this.totalWidth);
+    const leftRatio = this.scrollContainer.scrollLeft / safeTotalWidth;
+    const rawWidth = (this.viewportWidth / safeTotalWidth) * this.minimapPlotWidth;
+
+    const minWidth = Math.min(this.minimapPlotWidth, 12);
+    const width = clamp(rawWidth, minWidth, this.minimapPlotWidth);
+    const maxLeft = this.miniPadding.left + this.minimapPlotWidth - width;
+
+    const left = clamp(
+      this.miniPadding.left + leftRatio * this.minimapPlotWidth,
+      this.miniPadding.left,
+      maxLeft
+    );
+
+    return {
+      left,
+      width,
+      right: left + width,
+    };
+  }
+
+  timeToMiniX(time) {
+    if (!this.data || this.data.duration <= 0) {
+      return this.miniPadding.left;
+    }
+
+    const ratio = clamp(time, 0, this.data.duration) / this.data.duration;
+    return this.miniPadding.left + ratio * this.minimapPlotWidth;
+  }
+
+  miniClientXToLocal(clientX) {
+    if (!this.miniCanvas) {
+      return 0;
+    }
+
+    const rect = this.miniCanvas.getBoundingClientRect();
+    return clamp(clientX - rect.left, 0, this.minimapWidth);
+  }
+
+  miniLeftToScrollLeft(miniLeft) {
+    const maxScroll = Math.max(0, this.totalWidth - this.viewportWidth);
+
+    if (maxScroll <= 0) {
+      return 0;
+    }
+
+    const leftRatio = clamp(
+      (miniLeft - this.miniPadding.left) / Math.max(1, this.minimapPlotWidth),
+      0,
+      1
+    );
+
+    return clamp(leftRatio * this.totalWidth, 0, maxScroll);
+  }
+
   timeToX(time) {
     return this.padding.left + clamp(time, 0, this.data.duration) * this.pixelsPerSecond;
   }
@@ -694,13 +929,15 @@ class WaveformApp {
     this.scrollContainer = document.getElementById("chartScroll");
     this.canvasShell = document.getElementById("canvasShell");
     this.tooltip = document.getElementById("hoverTooltip");
+    this.miniMapCanvas = document.getElementById("miniMapCanvas");
 
     this.analyzer = new WaveformAnalyzer(256);
     this.renderer = new WaveformRenderer(
       this.mainCanvas,
       this.overlayCanvas,
       this.scrollContainer,
-      this.canvasShell
+      this.canvasShell,
+      this.miniMapCanvas
     );
 
     this.waveformData = null;
@@ -713,6 +950,7 @@ class WaveformApp {
     this.dragState = null;
     this.activeHandle = null;
     this.suppressClickJump = false;
+    this.minimapDragState = null;
     this.rafId = 0;
 
     this.analyzeButton.disabled = true;
@@ -815,6 +1053,16 @@ class WaveformApp {
       this.beginSelectionDrag(event);
     });
 
+    if (this.miniMapCanvas) {
+      this.miniMapCanvas.addEventListener("mousedown", (event) => {
+        this.beginMiniMapDrag(event);
+      });
+
+      this.miniMapCanvas.addEventListener("dragstart", (event) => {
+        event.preventDefault();
+      });
+    }
+
     this.mainCanvas.addEventListener("click", (event) => {
       if (this.suppressClickJump) {
         this.suppressClickJump = false;
@@ -844,6 +1092,10 @@ class WaveformApp {
     });
 
     window.addEventListener("mousemove", (event) => {
+      if (this.minimapDragState) {
+        this.updateMiniMapDrag(event.clientX);
+      }
+
       if (!this.dragState) {
         return;
       }
@@ -852,6 +1104,7 @@ class WaveformApp {
     });
 
     window.addEventListener("mouseup", (event) => {
+      this.endMiniMapDrag();
       this.endSelectionDrag(event);
     });
 
@@ -912,6 +1165,7 @@ class WaveformApp {
 
     window.addEventListener("resize", () => {
       this.renderer.resizeViewport();
+      this.renderer.resizeMiniMap();
 
       if (this.waveformData) {
         this.renderer.redrawStatic();
@@ -967,6 +1221,59 @@ class WaveformApp {
     }
 
     this.applyZoom(ZOOM_STEPS_SEC[nextIndex]);
+  }
+
+  beginMiniMapDrag(event) {
+    if (!this.waveformData || !this.miniMapCanvas || event.button !== 0) {
+      return;
+    }
+
+    event.preventDefault();
+
+    const localX = this.renderer.miniClientXToLocal(event.clientX);
+    const viewport = this.renderer.getMiniViewportRect();
+    let anchorOffset = 0;
+
+    if (viewport && localX >= viewport.left && localX <= viewport.right) {
+      anchorOffset = localX - viewport.left;
+    } else {
+      anchorOffset = viewport ? viewport.width / 2 : 0;
+    }
+
+    this.minimapDragState = { anchorOffset };
+    this.miniMapCanvas.classList.add("dragging");
+    this.applyMiniMapScroll(localX, anchorOffset);
+  }
+
+  updateMiniMapDrag(clientX) {
+    if (!this.minimapDragState || !this.waveformData) {
+      return;
+    }
+
+    const localX = this.renderer.miniClientXToLocal(clientX);
+    this.applyMiniMapScroll(localX, this.minimapDragState.anchorOffset);
+  }
+
+  endMiniMapDrag() {
+    if (!this.minimapDragState) {
+      return;
+    }
+
+    this.minimapDragState = null;
+
+    if (this.miniMapCanvas) {
+      this.miniMapCanvas.classList.remove("dragging");
+    }
+  }
+
+  applyMiniMapScroll(localX, anchorOffset = 0) {
+    if (!this.waveformData) {
+      return;
+    }
+
+    const targetLeft = localX - anchorOffset;
+    this.scrollContainer.scrollLeft = this.renderer.miniLeftToScrollLeft(targetLeft);
+    this.renderFrame();
   }
 
   beginSelectionDrag(event) {
@@ -1518,6 +1825,7 @@ class WaveformApp {
     const playTime = this.waveformData ? this.audio.currentTime : null;
     const activeSelection = this.getActiveSelectionRange();
     this.renderer.renderOverlay(playTime, this.hoverTime, activeSelection, this.activeHandle);
+    this.renderer.renderMiniMap(playTime);
   }
 
   updateTimeView(current, total) {
@@ -1570,4 +1878,5 @@ class WaveformApp {
 window.addEventListener("DOMContentLoaded", () => {
   new WaveformApp();
 });
+
 
