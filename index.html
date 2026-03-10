@@ -8,73 +8,86 @@
   </head>
   <body>
     <main class="app">
-      <h1>MP3 波形可視化ツール</h1>
-      <p class="lead">
-        mp3を選択して解析すると、編集ソフト風の波形ビューを表示します。
-      </p>
+      <header class="app-header">
+        <h1>MP3 波形エディタ</h1>
+        <p class="lead">ローカルで開いて、そのまま再生・選択・カットできます。</p>
+      </header>
 
-      <section class="controls">
-        <label class="control">
-          <span>1. MP3ファイル選択</span>
-          <input id="fileInput" type="file" accept=".mp3,audio/mpeg,audio/*" />
-        </label>
+      <section class="top-toolbar">
+        <section class="controls" aria-label="ファイルと解析">
+          <label class="control">
+            <span>ファイル</span>
+            <input id="fileInput" type="file" accept=".mp3,audio/mpeg,audio/*" />
+          </label>
 
-        <label class="control">
-          <span>2. 時間目盛り(ズーム)</span>
-          <select id="zoomSelect">
-            <option value="10" selected>10秒</option>
-            <option value="20">20秒</option>
-            <option value="30">30秒</option>
-            <option value="60">1分</option>
-            <option value="180">3分</option>
-            <option value="300">5分</option>
-          </select>
-        </label>
+          <button id="analyzeButton" type="button">解析</button>
+        </section>
 
-        <button id="analyzeButton" type="button">3. 解析する</button>
-      </section>
-
-      <section class="player-panel">
-        <h2>再生コントロール</h2>
-        <div class="player-buttons">
-          <button id="playButton" type="button" disabled>再生</button>
-          <button id="pauseButton" type="button" disabled>一時停止</button>
-          <button id="stopButton" type="button" disabled>停止</button>
-        </div>
-        <div class="edit-row">
-          <div class="edit-buttons">
-            <button id="cutButton" type="button" disabled>Cut selected segment</button>
-            <button id="exportButton" type="button" disabled>Export MP3</button>
+        <section class="player-panel" aria-label="再生と編集">
+          <div class="panel-row">
+            <h2>Playback</h2>
+            <p class="time-readout">
+              <span id="currentTimeText">0:00</span>
+              <span>/</span>
+              <span id="totalTimeText">0:00</span>
+            </p>
           </div>
-        </div>
 
-        <div class="volume-row">
-          <label for="volumeSlider">音量</label>
-          <input id="volumeSlider" type="range" min="0" max="100" step="1" value="100" />
-          <span id="volumeValue">100%</span>
-        </div>
+          <div class="player-buttons">
+            <button id="playButton" type="button" disabled>再生</button>
+            <button id="pauseButton" type="button" disabled>一時停止</button>
+            <button id="stopButton" type="button" disabled>停止</button>
+          </div>
 
-        <p class="time-readout">
-          <span id="currentTimeText">0:00</span>
-          <span>/</span>
-          <span id="totalTimeText">0:00</span>
-        </p>
-        <p class="hint">波形エリアは横スクロールできます。クリックで再生位置移動、ドラッグで区間選択、端点ドラッグで調整できます。</p>
-        <audio id="audioPlayer" preload="metadata"></audio>
+          <div class="edit-row">
+            <div class="edit-buttons">
+              <button id="undoButton" class="icon-btn" type="button" title="Undo" aria-label="Undo" disabled>↶</button>
+              <button id="redoButton" class="icon-btn" type="button" title="Redo" aria-label="Redo" disabled>↷</button>
+              <button id="cutButton" type="button" disabled>Cut selected segment</button>
+              <button id="exportButton" type="button" disabled>Export MP3</button>
+            </div>
+          </div>
+
+          <div class="volume-row">
+            <label for="volumeSlider">音量</label>
+            <input id="volumeSlider" type="range" min="0" max="100" step="1" value="100" />
+            <span id="volumeValue">100%</span>
+          </div>
+
+          <p class="hint">Space: 再生/一時停止。波形クリックでジャンプ、ドラッグで区間選択。</p>
+          <audio id="audioPlayer" preload="metadata"></audio>
+        </section>
       </section>
 
-      <section class="status-panel">
+      <section class="status-panel" aria-live="polite">
         <p id="statusText">ファイルを選択してください。</p>
         <p id="metaText"></p>
         <p id="selectionText" class="selection-text">選択範囲: なし</p>
       </section>
 
       <section class="chart-wrap">
-        <h2>波形表示エリア</h2>
+        <div class="chart-head">
+          <div class="chart-title-row">
+            <h2>波形タイムライン</h2>
+            <label class="zoom-inline" for="zoomSelect">
+              <span>ズーム</span>
+              <select id="zoomSelect">
+                <option value="10" selected>10秒</option>
+                <option value="20">20秒</option>
+                <option value="30">30秒</option>
+                <option value="60">1分</option>
+                <option value="180">3分</option>
+                <option value="300">5分</option>
+              </select>
+            </label>
+          </div>
+          <p class="minimap-hint">ミニマップをクリックで移動。枠ドラッグで表示位置を調整できます。</p>
+        </div>
+
         <div class="minimap-wrap">
           <canvas id="miniMapCanvas" width="1200" height="86"></canvas>
         </div>
-        <p class="minimap-hint">ミニマップをクリックで移動。表示範囲の枠をドラッグしてスクロールできます。</p>
+
         <div id="canvasShell" class="canvas-shell">
           <div id="chartScroll" class="chart-scroll">
             <canvas id="waveCanvas" width="1200" height="280"></canvas>
@@ -89,4 +102,3 @@
     <script src="./script.js" defer></script>
   </body>
 </html>
-

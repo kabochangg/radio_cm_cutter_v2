@@ -13,6 +13,8 @@ const HOVER_HEAD_COLOR = "rgba(12, 95, 112, 0.45)";
 const ZOOM_STEPS_SEC = [10, 20, 30, 60, 180, 300];
 const DRAG_THRESHOLD_PX = 6;
 const HANDLE_HIT_PX = 7;
+const HISTORY_LIMIT = 60;
+const MINIMAP_BINS = 2048;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -148,13 +150,157 @@ function buildEditedFileName(originalName) {
   const base = dot > 0 ? originalName.slice(0, dot) : originalName;
   return `${base}_edited.mp3`;
 }
+
+function cloneAudioBufferChannels(audioBuffer) {
+  const channels = [];
+
+  for (let ch = 0; ch < audioBuffer.numberOfChannels; ch += 1) {
+    channels.push(new Float32Array(audioBuffer.getChannelData(ch)));
+  }
+
+  return channels;
+}
+
+function createWaveformDataFromPayload(payload) {
+  return {
+    duration: payload.duration,
+    sampleRate: payload.sampleRate,
+    channelCount: payload.channelCount,
+    blockSize: payload.blockSize,
+    blockCount: payload.blockCount,
+    minValues: new Float32Array(payload.minValuesBuffer),
+    maxValues: new Float32Array(payload.maxValuesBuffer),
+    miniPeaks: payload.miniPeaksBuffer ? new Float32Array(payload.miniPeaksBuffer) : null,
+  };
+}
+
+class WaveWorkerClient {
+  constructor(workerPath = "./worker.js") {
+    this.worker = null;
+    this.pending = new Map();
+    this.nextRequestId = 1;
+    this.lastError = "";
+
+    if (typeof Worker !== "function") {
+      this.lastError = "Worker未対応ブラウザ";
+      return;
+    }
+
+    try {
+      this.worker = new Worker(workerPath);
+      this.worker.addEventListener("message", (event) => this.handleMessage(event));
+      this.worker.addEventListener("error", (event) => {
+        this.lastError = event.message || "Worker実行エラー";
+      });
+    } catch (error) {
+      this.lastError = String(error);
+      this.worker = null;
+    }
+  }
+
+  isAvailable() {
+    return !!this.worker;
+  }
+
+  request(type, payload, transferList = []) {
+    if (!this.worker) {
+      return Promise.reject(new Error("Workerが利用できません。"));
+    }
+
+    const requestId = this.nextRequestId;
+    this.nextRequestId += 1;
+
+    return new Promise((resolve, reject) => {
+      this.pending.set(requestId, { resolve, reject });
+      this.worker.postMessage({ requestId, type, payload }, transferList);
+    });
+  }
+
+  handleMessage(event) {
+    const { requestId, ok, result, error } = event.data || {};
+    const entry = this.pending.get(requestId);
+
+    if (!entry) {
+      return;
+    }
+
+    this.pending.delete(requestId);
+
+    if (ok) {
+      entry.resolve(result);
+      return;
+    }
+
+    entry.reject(new Error(error || "Worker処理に失敗しました。"));
+  }
+
+  async buildWaveformData(audioBuffer, blockSize, minimapBins = MINIMAP_BINS) {
+    const channels = cloneAudioBufferChannels(audioBuffer);
+    const channelBuffers = channels.map((channel) => channel.buffer);
+
+    const result = await this.request(
+      "build-waveform",
+      {
+        sampleRate: audioBuffer.sampleRate,
+        length: audioBuffer.length,
+        channelCount: audioBuffer.numberOfChannels,
+        blockSize,
+        minimapBins,
+        channelBuffers,
+      },
+      channelBuffers
+    );
+
+    return createWaveformDataFromPayload(result);
+  }
+
+  async cutAudioBuffer(audioBuffer, startSample, endSample, blockSize, minimapBins = MINIMAP_BINS) {
+    const channels = cloneAudioBufferChannels(audioBuffer);
+    const channelBuffers = channels.map((channel) => channel.buffer);
+
+    const result = await this.request(
+      "cut-segment",
+      {
+        sampleRate: audioBuffer.sampleRate,
+        length: audioBuffer.length,
+        channelCount: audioBuffer.numberOfChannels,
+        startSample,
+        endSample,
+        blockSize,
+        minimapBins,
+        channelBuffers,
+      },
+      channelBuffers
+    );
+
+    return {
+      sampleRate: result.sampleRate,
+      channelCount: result.channelCount,
+      length: result.length,
+      channels: result.channelBuffers.map((buffer) => new Float32Array(buffer)),
+      waveformData: createWaveformDataFromPayload(result.waveformData),
+    };
+  }
+
+  terminate() {
+    if (!this.worker) {
+      return;
+    }
+
+    this.worker.terminate();
+    this.worker = null;
+    this.pending.clear();
+  }
+}
 /**
  * 音声解析クラス。
  * 各ブロック(例:256サンプル)ごとに min/max を保持し、ズーム時に再利用する。
  */
 class WaveformAnalyzer {
-  constructor(blockSize = 256) {
+  constructor(blockSize = 256, workerClient = null, minimapBins = MINIMAP_BINS) {
     this.blockSize = blockSize;
+    this.workerClient = workerClient;
+    this.minimapBins = minimapBins;
   }
 
   async analyzeFile(file) {
@@ -169,13 +315,29 @@ class WaveformAnalyzer {
 
     try {
       const audioBuffer = await context.decodeAudioData(arrayBuffer);
-      const waveformData = this.buildWaveformData(audioBuffer);
+      const waveformData = await this.buildWaveformDataAsync(audioBuffer);
       return { audioBuffer, waveformData };
     } finally {
       await context.close().catch(() => {
         // close失敗は解析結果に影響しないため握りつぶす
       });
     }
+  }
+
+  async buildWaveformDataAsync(audioBuffer) {
+    if (this.workerClient && this.workerClient.isAvailable()) {
+      try {
+        return await this.workerClient.buildWaveformData(
+          audioBuffer,
+          this.blockSize,
+          this.minimapBins
+        );
+      } catch (_) {
+        // fallback below
+      }
+    }
+
+    return this.buildWaveformData(audioBuffer);
   }
 
   buildWaveformData(audioBuffer) {
@@ -239,7 +401,39 @@ class WaveformAnalyzer {
       blockCount,
       minValues,
       maxValues,
+      miniPeaks: this.buildMiniPeaks(minValues, maxValues, this.minimapBins),
     };
+  }
+
+  buildMiniPeaks(minValues, maxValues, minimapBins) {
+    const blockCount = minValues.length;
+
+    if (blockCount === 0) {
+      return new Float32Array(0);
+    }
+
+    const bins = Math.max(1, Math.min(minimapBins, blockCount));
+    const peaks = new Float32Array(bins);
+    const blocksPerBin = blockCount / bins;
+
+    for (let iBin = 0; iBin < bins; iBin += 1) {
+      const start = Math.floor(iBin * blocksPerBin);
+      const end = Math.max(start + 1, Math.floor((iBin + 1) * blocksPerBin));
+
+      let peak = 0;
+
+      for (let b = start; b < end && b < blockCount; b += 1) {
+        const localPeak = Math.max(Math.abs(minValues[b]), Math.abs(maxValues[b]));
+
+        if (localPeak > peak) {
+          peak = localPeak;
+        }
+      }
+
+      peaks[iBin] = peak;
+    }
+
+    return peaks;
   }
 }
 
@@ -491,37 +685,61 @@ class WaveformRenderer {
     ctx.lineTo(left + this.minimapPlotWidth, zeroY + 0.5);
     ctx.stroke();
 
-    const { minValues, maxValues, blockCount, blockSize, sampleRate } = this.data;
+    const { minValues, maxValues, miniPeaks, blockCount, blockSize, sampleRate } = this.data;
 
     if (blockCount > 0 && this.data.duration > 0) {
-      const miniPps = this.minimapPlotWidth / this.data.duration;
-      const samplesPerPixel = sampleRate / miniPps;
-      const blocksPerPixel = samplesPerPixel / blockSize;
       const pixelColumns = Math.max(1, Math.floor(this.minimapPlotWidth));
 
       ctx.strokeStyle = WAVE_COLOR;
       ctx.lineWidth = 1;
       ctx.beginPath();
 
-      for (let x = 0; x < pixelColumns; x += 1) {
-        const startBlock = clamp(Math.floor(x * blocksPerPixel), 0, blockCount - 1);
-        const endBlock = clamp(Math.floor((x + 1) * blocksPerPixel), startBlock, blockCount - 1);
+      if (miniPeaks && miniPeaks.length > 0) {
+        const binsPerPixel = miniPeaks.length / pixelColumns;
 
-        let peak = 0;
+        for (let x = 0; x < pixelColumns; x += 1) {
+          const startBin = clamp(Math.floor(x * binsPerPixel), 0, miniPeaks.length - 1);
+          const endBin = clamp(Math.floor((x + 1) * binsPerPixel), startBin, miniPeaks.length - 1);
 
-        for (let b = startBlock; b <= endBlock; b += 1) {
-          const localPeak = Math.max(Math.abs(minValues[b]), Math.abs(maxValues[b]));
+          let peak = 0;
 
-          if (localPeak > peak) {
-            peak = localPeak;
+          for (let b = startBin; b <= endBin; b += 1) {
+            if (miniPeaks[b] > peak) {
+              peak = miniPeaks[b];
+            }
           }
+
+          const yTop = zeroY - peak * usableHeight;
+          const px = left + x + 0.5;
+
+          ctx.moveTo(px, zeroY);
+          ctx.lineTo(px, yTop);
         }
+      } else {
+        const miniPps = this.minimapPlotWidth / this.data.duration;
+        const samplesPerPixel = sampleRate / miniPps;
+        const blocksPerPixel = samplesPerPixel / blockSize;
 
-        const yTop = zeroY - peak * usableHeight;
-        const px = left + x + 0.5;
+        for (let x = 0; x < pixelColumns; x += 1) {
+          const startBlock = clamp(Math.floor(x * blocksPerPixel), 0, blockCount - 1);
+          const endBlock = clamp(Math.floor((x + 1) * blocksPerPixel), startBlock, blockCount - 1);
 
-        ctx.moveTo(px, zeroY);
-        ctx.lineTo(px, yTop);
+          let peak = 0;
+
+          for (let b = startBlock; b <= endBlock; b += 1) {
+            const localPeak = Math.max(Math.abs(minValues[b]), Math.abs(maxValues[b]));
+
+            if (localPeak > peak) {
+              peak = localPeak;
+            }
+          }
+
+          const yTop = zeroY - peak * usableHeight;
+          const px = left + x + 0.5;
+
+          ctx.moveTo(px, zeroY);
+          ctx.lineTo(px, yTop);
+        }
       }
 
       ctx.stroke();
@@ -910,6 +1128,8 @@ class WaveformApp {
     this.playButton = document.getElementById("playButton");
     this.pauseButton = document.getElementById("pauseButton");
     this.stopButton = document.getElementById("stopButton");
+    this.undoButton = document.getElementById("undoButton");
+    this.redoButton = document.getElementById("redoButton");
     this.cutButton = document.getElementById("cutButton");
     this.exportButton = document.getElementById("exportButton");
 
@@ -931,7 +1151,8 @@ class WaveformApp {
     this.tooltip = document.getElementById("hoverTooltip");
     this.miniMapCanvas = document.getElementById("miniMapCanvas");
 
-    this.analyzer = new WaveformAnalyzer(256);
+    this.workerClient = new WaveWorkerClient("./worker.js");
+    this.analyzer = new WaveformAnalyzer(256, this.workerClient, MINIMAP_BINS);
     this.renderer = new WaveformRenderer(
       this.mainCanvas,
       this.overlayCanvas,
@@ -951,6 +1172,9 @@ class WaveformApp {
     this.activeHandle = null;
     this.suppressClickJump = false;
     this.minimapDragState = null;
+    this.undoStack = [];
+    this.redoStack = [];
+    this.pendingSelectionSnapshot = null;
     this.rafId = 0;
 
     this.analyzeButton.disabled = true;
@@ -962,6 +1186,7 @@ class WaveformApp {
     this.setStatus("ファイルを選択してください。");
     this.updateSelectionInfo(null);
     this.updateControlAvailability();
+    this.updateHistoryButtons();
   }
 
   bindEvents() {
@@ -1001,6 +1226,14 @@ class WaveformApp {
       this.renderer.scrollToTime(0);
       this.renderFrame();
       this.updateControlAvailability();
+    });
+
+    this.undoButton.addEventListener("click", () => {
+      this.handleUndo();
+    });
+
+    this.redoButton.addEventListener("click", () => {
+      this.handleRedo();
     });
 
     this.cutButton.addEventListener("click", async () => {
@@ -1061,6 +1294,7 @@ class WaveformApp {
       this.miniMapCanvas.addEventListener("dragstart", (event) => {
         event.preventDefault();
       });
+
     }
 
     this.mainCanvas.addEventListener("click", (event) => {
@@ -1137,6 +1371,10 @@ class WaveformApp {
     );
 
     window.addEventListener("keydown", (event) => {
+      if (this.handleHistoryShortcut(event)) {
+        return;
+      }
+
       if (event.key === "Escape" && this.clearSelection()) {
         event.preventDefault();
         return;
@@ -1177,7 +1415,12 @@ class WaveformApp {
     window.addEventListener("beforeunload", () => {
       this.clearAudioSource();
       this.stopRenderLoop();
+
+      if (this.workerClient) {
+        this.workerClient.terminate();
+      }
     });
+
   }
 
   updateVolumeView(percent) {
@@ -1221,6 +1464,182 @@ class WaveformApp {
     }
 
     this.applyZoom(ZOOM_STEPS_SEC[nextIndex]);
+  }
+
+  cloneSelectionRange(range) {
+    if (!range) {
+      return null;
+    }
+
+    return { start: range.start, end: range.end };
+  }
+
+  selectionRangesEqual(a, b) {
+    if (!a && !b) {
+      return true;
+    }
+
+    if (!a || !b) {
+      return false;
+    }
+
+    const epsilon = 0.000001;
+    return Math.abs(a.start - b.start) <= epsilon && Math.abs(a.end - b.end) <= epsilon;
+  }
+
+  captureHistoryState() {
+    return {
+      audioBufferData: this.audioBufferData,
+      waveformData: this.waveformData,
+      selectionRange: this.cloneSelectionRange(this.selectionRange),
+      currentTime: this.audio.currentTime,
+      scrollLeft: this.scrollContainer.scrollLeft,
+      zoomSec: Number(this.zoomSelect.value),
+      currentFileName: this.currentFileName,
+    };
+  }
+
+  pushUndoSnapshot(snapshot) {
+    if (!snapshot) {
+      return;
+    }
+
+    this.undoStack.push(snapshot);
+
+    if (this.undoStack.length > HISTORY_LIMIT) {
+      this.undoStack.shift();
+    }
+
+    this.redoStack.length = 0;
+    this.updateHistoryButtons();
+  }
+
+  clearHistory() {
+    this.undoStack.length = 0;
+    this.redoStack.length = 0;
+    this.pendingSelectionSnapshot = null;
+    this.updateHistoryButtons();
+  }
+
+  handleHistoryShortcut(event) {
+    const isMod = event.ctrlKey || event.metaKey;
+
+    if (!isMod || event.altKey) {
+      return false;
+    }
+
+    const key = event.key.toLowerCase();
+    const target = event.target instanceof Element ? event.target : null;
+    const active = document.activeElement instanceof Element ? document.activeElement : null;
+
+    if (this.isTypingElement(target) || this.isTypingElement(active)) {
+      return false;
+    }
+
+    if (key === "z" && !event.shiftKey) {
+      event.preventDefault();
+      this.handleUndo();
+      return true;
+    }
+
+    if (key === "y" || (key === "z" && event.shiftKey)) {
+      event.preventDefault();
+      this.handleRedo();
+      return true;
+    }
+
+    return false;
+  }
+
+  handleUndo() {
+    if (this.undoStack.length === 0) {
+      return;
+    }
+
+    const current = this.captureHistoryState();
+    const snapshot = this.undoStack.pop();
+    this.redoStack.push(current);
+
+    if (this.redoStack.length > HISTORY_LIMIT) {
+      this.redoStack.shift();
+    }
+
+    this.restoreFromSnapshot(snapshot, "Undoを実行しました。");
+    this.updateHistoryButtons();
+  }
+
+  handleRedo() {
+    if (this.redoStack.length === 0) {
+      return;
+    }
+
+    const current = this.captureHistoryState();
+    const snapshot = this.redoStack.pop();
+    this.undoStack.push(current);
+
+    if (this.undoStack.length > HISTORY_LIMIT) {
+      this.undoStack.shift();
+    }
+
+    this.restoreFromSnapshot(snapshot, "Redoを実行しました。");
+    this.updateHistoryButtons();
+  }
+
+  restoreFromSnapshot(snapshot, statusMessage) {
+    this.audio.pause();
+    this.stopRenderLoop();
+
+    const previousAudioBuffer = this.audioBufferData;
+    const previousWaveformData = this.waveformData;
+
+    this.audioBufferData = snapshot.audioBufferData || null;
+    this.waveformData = snapshot.waveformData || null;
+    this.selectionRange = this.cloneSelectionRange(snapshot.selectionRange);
+    this.dragState = null;
+    this.activeHandle = null;
+    this.hoverTime = null;
+    this.pendingSelectionSnapshot = null;
+    this.tooltip.hidden = true;
+    this.currentFileName = snapshot.currentFileName || this.currentFileName;
+
+    const zoom = ZOOM_STEPS_SEC.includes(snapshot.zoomSec) ? snapshot.zoomSec : Number(this.zoomSelect.value);
+    this.zoomSelect.value = String(zoom);
+    this.renderer.setZoomInterval(zoom);
+
+    if (this.waveformData && this.audioBufferData) {
+      const audioChanged = previousAudioBuffer !== this.audioBufferData || previousWaveformData !== this.waveformData;
+      const seekTime = clamp(snapshot.currentTime, 0, this.waveformData.duration);
+
+      if (audioChanged) {
+        this.renderer.setData(this.waveformData);
+        const wavBlob = audioBufferToWavBlob(this.audioBufferData);
+        this.setAudioSource(wavBlob, seekTime);
+      } else {
+        this.audio.currentTime = seekTime;
+      }
+
+      const maxScroll = Math.max(0, this.renderer.totalWidth - this.renderer.viewportWidth);
+      this.scrollContainer.scrollLeft = clamp(snapshot.scrollLeft, 0, maxScroll);
+      this.updateTimeView(seekTime, this.waveformData.duration);
+    } else {
+      this.renderer.clearData();
+      this.clearAudioSource();
+      this.updateTimeView(0, 0);
+    }
+
+    this.updateSelectionInfo(this.selectionRange);
+    this.updateControlAvailability();
+    this.renderFrame();
+    this.setStatus(statusMessage);
+  }
+
+  updateHistoryButtons() {
+    if (!this.undoButton || !this.redoButton) {
+      return;
+    }
+
+    this.undoButton.disabled = this.undoStack.length === 0;
+    this.redoButton.disabled = this.redoStack.length === 0;
   }
 
   beginMiniMapDrag(event) {
@@ -1282,6 +1701,7 @@ class WaveformApp {
     }
 
     event.preventDefault();
+    this.pendingSelectionSnapshot = this.captureHistoryState();
 
     const edge = this.findHandleHit(event.clientX);
 
@@ -1369,6 +1789,16 @@ class WaveformApp {
       this.suppressNextClickJump();
     }
 
+    const beforeSelection = this.pendingSelectionSnapshot ? this.pendingSelectionSnapshot.selectionRange : null;
+    const didSelectionChange = this.pendingSelectionSnapshot
+      ? !this.selectionRangesEqual(beforeSelection, this.selectionRange)
+      : false;
+
+    if (didSelectionChange) {
+      this.pushUndoSnapshot(this.pendingSelectionSnapshot);
+    }
+
+    this.pendingSelectionSnapshot = null;
     this.dragState = null;
     this.activeHandle = null;
     this.updateSelectionInfo(this.selectionRange);
@@ -1427,7 +1857,12 @@ class WaveformApp {
       return false;
     }
 
+    if (this.selectionRange) {
+      this.pushUndoSnapshot(this.captureHistoryState());
+    }
+
     this.selectionRange = null;
+    this.pendingSelectionSnapshot = null;
     this.dragState = null;
     this.activeHandle = null;
     this.updateSelectionInfo(null);
@@ -1460,6 +1895,7 @@ class WaveformApp {
           numberOfChannels: channelCount,
           sampleRate,
         });
+
       } catch (_) {
         // fallback below
       }
@@ -1479,7 +1915,24 @@ class WaveformApp {
       await context.close().catch(() => {
         // close失敗は後続に影響しない
       });
+
     }
+  }
+
+  async createAudioBufferFromChannels(sampleRate, channels) {
+    if (!channels || channels.length === 0) {
+      throw new Error("チャンネルデータがありません。");
+    }
+
+    const channelCount = channels.length;
+    const length = channels[0].length;
+    const buffer = await this.createEmptyAudioBuffer(sampleRate, channelCount, length);
+
+    for (let ch = 0; ch < channelCount; ch += 1) {
+      buffer.getChannelData(ch).set(channels[ch]);
+    }
+
+    return buffer;
   }
 
   async handleCutSelectedSegment() {
@@ -1512,27 +1965,51 @@ class WaveformApp {
 
     const oldTime = this.audio.currentTime;
     const wasPlaying = this.isPlaying();
+    const beforeCutSnapshot = this.captureHistoryState();
 
     try {
       this.setStatus("選択区間をカットしています...");
       this.audio.pause();
       this.stopRenderLoop();
 
-      const channelCount = sourceBuffer.numberOfChannels;
-      const newBuffer = await this.createEmptyAudioBuffer(sampleRate, channelCount, newLength);
+      let newBuffer;
+      let newWaveformData;
 
-      for (let ch = 0; ch < channelCount; ch += 1) {
-        const src = sourceBuffer.getChannelData(ch);
-        const dst = newBuffer.getChannelData(ch);
+      if (this.workerClient && this.workerClient.isAvailable()) {
+        try {
+          const workerResult = await this.workerClient.cutAudioBuffer(
+            sourceBuffer,
+            startSample,
+            endSample,
+            this.analyzer.blockSize,
+            this.analyzer.minimapBins
+          );
 
-        const before = src.subarray(0, startSample);
-        dst.set(before, 0);
-
-        const after = src.subarray(endSample);
-        dst.set(after, before.length);
+          newBuffer = await this.createAudioBufferFromChannels(workerResult.sampleRate, workerResult.channels);
+          newWaveformData = workerResult.waveformData;
+        } catch (_) {
+          // Worker失敗時は同期処理にフォールバック
+        }
       }
 
-      const newWaveformData = this.analyzer.buildWaveformData(newBuffer);
+      if (!newBuffer || !newWaveformData) {
+        const channelCount = sourceBuffer.numberOfChannels;
+        newBuffer = await this.createEmptyAudioBuffer(sampleRate, channelCount, newLength);
+
+        for (let ch = 0; ch < channelCount; ch += 1) {
+          const src = sourceBuffer.getChannelData(ch);
+          const dst = newBuffer.getChannelData(ch);
+
+          const before = src.subarray(0, startSample);
+          dst.set(before, 0);
+
+          const after = src.subarray(endSample);
+          dst.set(after, before.length);
+        }
+
+        newWaveformData = await this.analyzer.buildWaveformDataAsync(newBuffer);
+      }
+
       const wavBlob = audioBufferToWavBlob(newBuffer);
 
       let mappedTime = oldTime;
@@ -1563,6 +2040,7 @@ class WaveformApp {
       this.updateSelectionInfo(null);
       this.updateControlAvailability();
       this.renderFrame();
+      this.pushUndoSnapshot(beforeCutSnapshot);
 
       this.metaText.textContent =
         `長さ: ${newWaveformData.duration.toFixed(2)}秒 / サンプルレート: ${newWaveformData.sampleRate}Hz / ` +
@@ -1627,6 +2105,7 @@ class WaveformApp {
       this.currentFileName = file.name;
       this.audioBufferData = audioBuffer;
       this.waveformData = waveformData;
+      this.clearHistory();
       this.renderer.setZoomInterval(Number(this.zoomSelect.value));
       this.renderer.setData(waveformData);
 
@@ -1659,6 +2138,7 @@ class WaveformApp {
       this.selectionRange = null;
       this.dragState = null;
       this.activeHandle = null;
+      this.clearHistory();
       this.updateSelectionInfo(null);
     } finally {
       this.disableWhileAnalyzing(false);
@@ -1696,6 +2176,7 @@ class WaveformApp {
       this.audio.play().catch(() => {
         // 再生失敗時はUIのみ更新
       });
+
     }
 
     this.setStatus(`ジャンプしました: ${formatTime(targetTime)}。`);
@@ -1841,6 +2322,8 @@ class WaveformApp {
       this.stopButton.disabled = true;
       this.cutButton.disabled = true;
       this.exportButton.disabled = true;
+      this.undoButton.disabled = true;
+      this.redoButton.disabled = true;
       this.stopRenderLoop();
       this.audio.pause();
       return;
@@ -1848,6 +2331,7 @@ class WaveformApp {
 
     this.analyzeButton.disabled = !this.getSelectedFile();
     this.updateControlAvailability();
+    this.updateHistoryButtons();
   }
 
   updateControlAvailability() {
@@ -1859,6 +2343,7 @@ class WaveformApp {
       this.stopButton.disabled = true;
       this.cutButton.disabled = true;
       this.exportButton.disabled = true;
+      this.updateHistoryButtons();
       return;
     }
 
@@ -1867,6 +2352,7 @@ class WaveformApp {
     this.stopButton.disabled = !this.isPlaying() && this.audio.currentTime <= 0;
     this.cutButton.disabled = !this.selectionRange;
     this.exportButton.disabled = false;
+    this.updateHistoryButtons();
   }
 
   setStatus(message, isError = false) {
@@ -1878,5 +2364,6 @@ class WaveformApp {
 window.addEventListener("DOMContentLoaded", () => {
   new WaveformApp();
 });
+
 
 
