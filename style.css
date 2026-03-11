@@ -147,6 +147,12 @@ button:disabled {
   font-size: 0.92rem;
 }
 
+.selection-info {
+  margin: 8px 0 0;
+  color: #33536f;
+  font-size: 0.9rem;
+}
+
 .status-panel p {
   margin: 6px 0;
 }

@@ -9,6 +9,9 @@ const GRID_COLOR = "#dfe8f2";
 const TICK_TEXT_COLOR = "#4f6277";
 const PLAYHEAD_COLOR = "#d62f2f";
 const HOVER_HEAD_COLOR = "rgba(12, 95, 112, 0.45)";
+const SELECTION_FILL_COLOR = "rgba(23, 127, 183, 0.18)";
+const SELECTION_HATCH_COLOR = "rgba(16, 99, 158, 0.45)";
+const SELECTION_EDGE_COLOR = "rgba(8, 77, 125, 0.95)";
 const ZOOM_STEPS_SEC = [10, 20, 30, 60, 180, 300];
 
 function clamp(value, min, max) {
@@ -141,6 +144,7 @@ class WaveformRenderer {
     this.zoomIntervalSec = 10;
     // 波形本体は内部解像度を固定し、横幅上限を広く確保してズーム差を出しやすくする
     this.mainRenderDpr = 1;
+    this.selectionPattern = this.createHatchPattern();
 
     this.data = null;
     this.totalWidth = 1200;
@@ -152,6 +156,30 @@ class WaveformRenderer {
     this.resizeViewport();
     this.drawEmpty();
     this.renderOverlay(null, null);
+  }
+
+  createHatchPattern() {
+    const patternCanvas = document.createElement("canvas");
+    patternCanvas.width = 12;
+    patternCanvas.height = 12;
+
+    const patternCtx = patternCanvas.getContext("2d");
+
+    if (!patternCtx) {
+      return null;
+    }
+
+    patternCtx.strokeStyle = SELECTION_HATCH_COLOR;
+    patternCtx.lineWidth = 2;
+
+    patternCtx.beginPath();
+    patternCtx.moveTo(-3, 12);
+    patternCtx.lineTo(12, -3);
+    patternCtx.moveTo(3, 15);
+    patternCtx.lineTo(15, 3);
+    patternCtx.stroke();
+
+    return this.overlayCtx.createPattern(patternCanvas, "repeat");
   }
 
   setData(data) {
@@ -386,7 +414,7 @@ class WaveformRenderer {
     ctx.fillText("time →", 8, CANVAS_HEIGHT - this.padding.bottom + 8);
   }
 
-  renderOverlay(playbackTime, hoverTime) {
+  renderOverlay(playbackTime, hoverTime, selectionRange) {
     this.overlayCtx.clearRect(0, 0, this.viewportWidth, CANVAS_HEIGHT);
 
     if (!this.data) {
@@ -395,6 +423,10 @@ class WaveformRenderer {
 
     const scrollLeft = this.scrollContainer.scrollLeft;
 
+    if (selectionRange) {
+      this.drawSelectionOverlay(selectionRange, scrollLeft);
+    }
+
     if (typeof hoverTime === "number") {
       this.drawOverlayLine(hoverTime, HOVER_HEAD_COLOR, 1, scrollLeft);
     }
@@ -402,6 +434,54 @@ class WaveformRenderer {
     if (typeof playbackTime === "number") {
       this.drawOverlayLine(playbackTime, PLAYHEAD_COLOR, 2, scrollLeft);
     }
+  }
+
+  drawSelectionOverlay(selectionRange, scrollLeft) {
+    const start = clamp(Math.min(selectionRange.startTime, selectionRange.endTime), 0, this.data.duration);
+    const end = clamp(Math.max(selectionRange.startTime, selectionRange.endTime), 0, this.data.duration);
+
+    if (end <= start) {
+      return;
+    }
+
+    const startGlobal = this.timeToX(start);
+    const endGlobal = this.timeToX(end);
+    const chartTop = this.padding.top;
+    const chartHeight = CANVAS_HEIGHT - this.padding.top - this.padding.bottom;
+
+    const drawLeft = clamp(startGlobal - scrollLeft, 0, this.viewportWidth);
+    const drawRight = clamp(endGlobal - scrollLeft, 0, this.viewportWidth);
+    const width = drawRight - drawLeft;
+
+    if (width <= 0) {
+      return;
+    }
+
+    this.overlayCtx.save();
+    this.overlayCtx.fillStyle = SELECTION_FILL_COLOR;
+    this.overlayCtx.fillRect(drawLeft, chartTop, width, chartHeight);
+
+    if (this.selectionPattern) {
+      this.overlayCtx.fillStyle = this.selectionPattern;
+      this.overlayCtx.fillRect(drawLeft, chartTop, width, chartHeight);
+    }
+
+    this.drawSelectionEdge(startGlobal - scrollLeft, chartTop, chartHeight);
+    this.drawSelectionEdge(endGlobal - scrollLeft, chartTop, chartHeight);
+    this.overlayCtx.restore();
+  }
+
+  drawSelectionEdge(x, top, height) {
+    if (x < 0 || x > this.viewportWidth) {
+      return;
+    }
+
+    this.overlayCtx.strokeStyle = SELECTION_EDGE_COLOR;
+    this.overlayCtx.lineWidth = 2;
+    this.overlayCtx.beginPath();
+    this.overlayCtx.moveTo(x, top);
+    this.overlayCtx.lineTo(x, top + height);
+    this.overlayCtx.stroke();
   }
 
   drawOverlayLine(time, color, width, scrollLeft) {
@@ -482,6 +562,7 @@ class WaveformApp {
     this.scrollContainer = document.getElementById("chartScroll");
     this.canvasShell = document.getElementById("canvasShell");
     this.tooltip = document.getElementById("hoverTooltip");
+    this.selectionInfo = document.getElementById("selectionInfo");
 
     this.analyzer = new WaveformAnalyzer(256);
     this.renderer = new WaveformRenderer(
@@ -495,6 +576,10 @@ class WaveformApp {
     this.currentObjectUrl = "";
     this.hoverTime = null;
     this.rafId = 0;
+    this.dragThresholdPx = 6;
+    this.pointerDrag = null;
+    this.selectionRange = null;
+    this.draggingSelectionRange = null;
 
     this.analyzeButton.disabled = true;
     this.audio.volume = 1;
@@ -578,8 +663,8 @@ class WaveformApp {
       this.updateControlAvailability();
     });
 
-    this.mainCanvas.addEventListener("click", (event) => {
-      this.handleCanvasClick(event);
+    this.mainCanvas.addEventListener("mousedown", (event) => {
+      this.handleCanvasMouseDown(event);
     });
 
     this.mainCanvas.addEventListener("mousemove", (event) => {
@@ -587,9 +672,21 @@ class WaveformApp {
     });
 
     this.mainCanvas.addEventListener("mouseleave", () => {
+      if (this.pointerDrag) {
+        return;
+      }
+
       this.hoverTime = null;
       this.tooltip.hidden = true;
       this.renderFrame();
+    });
+
+    window.addEventListener("mousemove", (event) => {
+      this.handleGlobalMouseMove(event);
+    });
+
+    window.addEventListener("mouseup", (event) => {
+      this.handleGlobalMouseUp(event);
     });
 
     this.scrollContainer.addEventListener("scroll", () => {
@@ -623,6 +720,14 @@ class WaveformApp {
     );
 
     window.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        if (this.clearSelection()) {
+          this.setStatus("選択範囲を解除しました。");
+        }
+
+        return;
+      }
+
       if (!this.shouldHandleSpaceShortcut(event)) {
         return;
       }
@@ -729,6 +834,7 @@ class WaveformApp {
       this.updateTimeView(0, result.duration);
       this.hoverTime = null;
       this.tooltip.hidden = true;
+      this.clearSelection(false);
       this.renderFrame();
 
       this.metaText.textContent =
@@ -741,6 +847,7 @@ class WaveformApp {
       this.renderer.clearData();
       this.clearAudioSource();
       this.updateTimeView(0, 0);
+      this.clearSelection(false);
       this.setStatus("解析に失敗しました。mp3ファイルを確認してください。", true);
       this.metaText.textContent = String(error);
     } finally {
@@ -763,11 +870,71 @@ class WaveformApp {
     }
   }
 
-  handleCanvasClick(event) {
-    if (!this.waveformData) {
+  handleCanvasMouseDown(event) {
+    if (!this.waveformData || event.button !== 0) {
       return;
     }
 
+    const startTime = this.renderer.timeFromPointerEvent(event);
+    this.pointerDrag = {
+      startX: event.clientX,
+      startTime,
+      lastTime: startTime,
+      selecting: false,
+    };
+  }
+
+  handleGlobalMouseMove(event) {
+    if (!this.waveformData || !this.pointerDrag) {
+      return;
+    }
+
+    const currentTime = this.renderer.timeFromPointerEvent(event);
+    const moved = Math.abs(event.clientX - this.pointerDrag.startX);
+
+    this.pointerDrag.lastTime = currentTime;
+
+    if (!this.pointerDrag.selecting && moved >= this.dragThresholdPx) {
+      this.pointerDrag.selecting = true;
+    }
+
+    if (!this.pointerDrag.selecting) {
+      return;
+    }
+
+    this.draggingSelectionRange = {
+      startTime: this.pointerDrag.startTime,
+      endTime: currentTime,
+    };
+    this.updateSelectionInfo(this.draggingSelectionRange, true);
+    this.renderFrame();
+  }
+
+  handleGlobalMouseUp(event) {
+    if (!this.waveformData || !this.pointerDrag || event.button !== 0) {
+      return;
+    }
+
+    const drag = this.pointerDrag;
+    this.pointerDrag = null;
+
+    if (drag.selecting) {
+      const finalRange = {
+        startTime: drag.startTime,
+        endTime: drag.lastTime,
+      };
+      this.draggingSelectionRange = null;
+      this.applySelection(finalRange);
+      this.setStatus("区間を選択しました。");
+      return;
+    }
+
+    this.draggingSelectionRange = null;
+    this.clearSelection(false);
+    this.jumpToPointerTime(event);
+  }
+
+  jumpToPointerTime(event) {
     const targetTime = this.renderer.timeFromPointerEvent(event);
     const wasPlaying = this.isPlaying();
 
@@ -795,6 +962,68 @@ class WaveformApp {
     this.tooltip.textContent = formatTime(this.hoverTime);
 
     this.renderFrame();
+  }
+
+  applySelection(range) {
+    const normalized = this.normalizeSelection(range);
+
+    if (!normalized) {
+      this.clearSelection(false);
+      return;
+    }
+
+    this.selectionRange = normalized;
+    this.updateSelectionInfo(this.selectionRange, false);
+    this.renderFrame();
+  }
+
+  normalizeSelection(range) {
+    if (!range || !this.waveformData) {
+      return null;
+    }
+
+    const duration = this.getDuration();
+    const startTime = clamp(Math.min(range.startTime, range.endTime), 0, duration);
+    const endTime = clamp(Math.max(range.startTime, range.endTime), 0, duration);
+
+    if (endTime - startTime <= 0) {
+      return null;
+    }
+
+    return { startTime, endTime };
+  }
+
+  clearSelection(shouldRender = true) {
+    const hadSelection = !!this.selectionRange || !!this.draggingSelectionRange;
+    this.selectionRange = null;
+    this.draggingSelectionRange = null;
+    this.updateSelectionInfo(null, false);
+
+    if (shouldRender) {
+      this.renderFrame();
+    }
+
+    return hadSelection;
+  }
+
+  updateSelectionInfo(range, isPreview) {
+    if (!this.selectionInfo) {
+      return;
+    }
+
+    const normalized = this.normalizeSelection(range);
+
+    if (!normalized) {
+      this.selectionInfo.textContent = "未選択";
+      return;
+    }
+
+    const length = normalized.endTime - normalized.startTime;
+    const prefix = isPreview ? "選択中" : "選択";
+
+    this.selectionInfo.textContent =
+      `${prefix}: ${formatTime(normalized.startTime)} - ${formatTime(normalized.endTime)} ` +
+      `(長さ ${length.toFixed(2)}秒)`;
   }
 
   setAudioSource(file) {
@@ -903,7 +1132,8 @@ class WaveformApp {
 
   renderFrame() {
     const playTime = this.waveformData ? this.audio.currentTime : null;
-    this.renderer.renderOverlay(playTime, this.hoverTime);
+    const selectionRange = this.draggingSelectionRange || this.selectionRange;
+    this.renderer.renderOverlay(playTime, this.hoverTime, selectionRange);
   }
 
   updateTimeView(current, total) {
